@@ -27,6 +27,7 @@ pub enum LPStakingHandleMsg {
         amount: Uint128,
         msg: Binary,
     },
+    ClaimRewards{},
 
     // Admin commands
     StopContract {},

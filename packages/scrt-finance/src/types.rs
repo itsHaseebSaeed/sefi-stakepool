@@ -8,6 +8,7 @@ pub struct RewardPool {
     pub residue: u128,
     pub inc_token_supply: u128,
     pub acc_reward_per_share: u128,
+    pub total_rewards:u128,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, JsonSchema)]

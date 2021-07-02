@@ -11,7 +11,7 @@ use secret_toolkit::utils::{pad_handle_result, pad_query_result};
 
 use crate::constants::*;
 use crate::querier::query_pending;
-use crate::state::Config;
+use crate::state::{Config, Lottery, lottery, log_string};
 use scrt_finance::lp_staking_msg::LPStakingResponseStatus::Success;
 use scrt_finance::lp_staking_msg::{
     LPStakingHandleAnswer, LPStakingHandleMsg, LPStakingHookMsg, LPStakingInitMsg,
@@ -20,6 +20,14 @@ use scrt_finance::lp_staking_msg::{
 use scrt_finance::master_msg::MasterHandleMsg;
 use scrt_finance::types::{RewardPool, TokenInfo, UserInfo};
 use scrt_finance::viewing_key::{ViewingKey, VIEWING_KEY_SIZE};
+
+use sha2::{Digest, Sha256};
+
+use rand::distributions::WeightedIndex;
+use rand::prelude::*;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaChaRng;
+
 
 pub fn init<S: Storage, A: Api, Q: Querier>(
     deps: &mut Extern<S, A, Q>,
@@ -49,6 +57,7 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
             residue: 0,
             inc_token_supply: 0,
             acc_reward_per_share: 0,
+            total_rewards: 0
         },
     )?;
 
@@ -86,6 +95,26 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
             msg.inc_token.address,
         )?,
     ];
+
+
+    //lottery init
+    let height = env.block.height;
+    let duration = 1u64;
+    //Create first lottery
+    ///Why entropy and seed are the same here
+    let a_lottery = Lottery {
+        entries: Vec::default(),
+        entropy: prng_seed_hashed.to_vec(),
+        start_height: height + 1,
+        end_height: height + duration + 1,
+        seed: prng_seed_hashed.to_vec(),
+        duration
+    };
+
+    // Save to state
+    lottery(&mut deps.storage).save(&a_lottery)?;
+
+
 
     Ok(InitResponse {
         messages,
@@ -126,6 +155,7 @@ pub fn handle<S: Storage, A: Api, Q: Querier>(
             rewards.u128(),
             hook.map(|h| from_binary(&h).unwrap()),
         ),
+        LPStakingHandleMsg::ClaimRewards { } => claim_rewards(deps,env),
         _ => Err(StdError::generic_err("Unavailable or unknown action")),
     };
 
@@ -177,6 +207,159 @@ pub fn authenticated_queries<S: Storage, A: Api, Q: Querier>(
 
 // Handle functions
 
+fn claim_rewards<S: Storage, A: Api, Q: Querier>(
+    deps: &mut Extern<S, A, Q>,
+    env: Env,
+) -> StdResult<HandleResponse> {
+
+
+    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
+    let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY)?;
+    let winning_amount = reward_pool.total_rewards;
+    if winning_amount == 0 {
+        return Err(StdError::generic_err(
+            "no rewards available",
+        ));
+    }
+    reward_pool.total_rewards=0;
+    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
+
+
+    let mut a_lottery = lottery(&mut deps.storage).load()?;
+    validate_end_height(a_lottery.end_height, env.clone())?;
+    validate_start_height(a_lottery.start_height, env.clone())?;
+    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
+    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+
+    // restart the lottery in the next block
+    a_lottery.start_height = &env.block.height + 1;
+    a_lottery.end_height = &env.block.height + a_lottery.duration + 1;
+    lottery(&mut deps.storage).save(&a_lottery)?;
+
+
+    let entry_iter = &a_lottery.entries.clone();
+    let weight_iter = &a_lottery.entries.clone();
+    let entries: Vec<_> = entry_iter.into_iter().map(|(k, _)| k).collect();
+    let weights: Vec<_> = weight_iter.into_iter().map(|(_, v)| v.u128()).collect();
+
+
+    log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
+
+    let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY)?;
+    let prng_seed = config.prng_seed;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&prng_seed);
+    hasher.update(&a_lottery.entropy);
+    let hash = hasher.finalize();
+
+    let mut result = [0u8; 32];
+    result.copy_from_slice(hash.as_slice());
+
+    let mut rng: ChaChaRng = ChaChaRng::from_seed(result);
+    let dist = WeightedIndex::new(&weights).unwrap();
+    let sample = dist.sample(&mut rng).clone();
+    let winner = entries[sample];
+
+    let winner_human = &deps.api.human_address(&winner.clone()).unwrap();
+    log_string(&mut deps.storage).save(&format!("And the winner is {}", winner_human.as_str()))?;
+
+    let mut messages: Vec<CosmosMsg> = vec![];
+    messages.push(secret_toolkit::snip20::transfer_msg(
+        winner_human.clone(),
+        Uint128(winning_amount),
+        None,
+        RESPONSE_BLOCK_SIZE,
+        config.reward_token.contract_hash,
+        config.reward_token.address,
+    )?);
+
+
+
+    Ok(HandleResponse {
+        messages,
+        log: vec![],
+        data: Some(to_binary(&LPStakingHandleAnswer::ClaimRewardPool {
+            status: Success,
+        })?),
+    })
+}
+
+
+fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
+    deps: &mut Extern<S, A, Q>,
+    env: Env,
+    mut reward_pool:RewardPool
+) -> StdResult<RewardPool> {
+
+
+    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
+    let winning_amount = reward_pool.total_rewards;
+    if winning_amount == 0 {
+        return Err(StdError::generic_err(
+            "no rewards available",
+        ));
+    }
+    reward_pool.total_rewards=0;
+    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
+
+
+    let mut a_lottery = lottery(&mut deps.storage).load()?;
+    validate_end_height(a_lottery.end_height, env.clone())?;
+    validate_start_height(a_lottery.start_height, env.clone())?;
+    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
+    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+
+    // restart the lottery in the next block
+    a_lottery.start_height = &env.block.height + 1;
+    a_lottery.end_height = &env.block.height + a_lottery.duration + 1;
+    lottery(&mut deps.storage).save(&a_lottery)?;
+
+
+    let entry_iter = &a_lottery.entries.clone();
+    let weight_iter = &a_lottery.entries.clone();
+    let entries: Vec<_> = entry_iter.into_iter().map(|(k, _)| k).collect();
+    let weights: Vec<_> = weight_iter.into_iter().map(|(_, v)| v.u128()).collect();
+
+
+    log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
+
+    let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY)?;
+    let prng_seed = config.prng_seed;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&prng_seed);
+    hasher.update(&a_lottery.entropy);
+    let hash = hasher.finalize();
+
+    let mut result = [0u8; 32];
+    result.copy_from_slice(hash.as_slice());
+
+    let mut rng: ChaChaRng = ChaChaRng::from_seed(result);
+    let dist = WeightedIndex::new(&weights).unwrap();
+    let sample = dist.sample(&mut rng).clone();
+    let winner = entries[sample];
+
+    let winner_human = &deps.api.human_address(&winner.clone()).unwrap();
+    log_string(&mut deps.storage).save(&format!("And the winner is {}", winner_human.as_str()))?;
+
+    let mut messages: Vec<CosmosMsg> = vec![];
+    messages.push(secret_toolkit::snip20::transfer_msg(
+        winner_human.clone(),
+        Uint128(winning_amount),
+        None,
+        RESPONSE_BLOCK_SIZE,
+        config.reward_token.contract_hash,
+        config.reward_token.address,
+    )?);
+
+
+
+
+
+    Ok(reward_pool)
+}
+
 fn receive<S: Storage, A: Api, Q: Querier>(
     deps: &mut Extern<S, A, Q>,
     env: Env,
@@ -204,7 +387,12 @@ fn notify_allocation<S: Storage, A: Api, Q: Querier>(
         ));
     }
     //amount == rewards
-    let reward_pool = update_rewards(deps, /*&env, &config,*/ rewards)?;
+    let mut reward_pool = update_rewards(deps, /*&env, &config,*/ rewards)?;
+
+    //claim_rewards calling
+    if reward_pool.inc_token_supply>0{
+     reward_pool= claim_rewards_hook(deps,env.clone(),reward_pool)?;
+    }
 
     let mut response = Ok(HandleResponse {
         messages: vec![],
@@ -216,7 +404,7 @@ fn notify_allocation<S: Storage, A: Api, Q: Querier>(
         response = match hook_msg {
             LPStakingHookMsg::Deposit { from, amount } => {
                 deposit_hook(deps, env, config, reward_pool, from, amount.u128())
-            }
+            },
             LPStakingHookMsg::Redeem { to, amount } => {
                 redeem_hook(deps, env, config, reward_pool, to, amount)
             }
@@ -253,42 +441,42 @@ fn deposit<S: Storage, A: Api, Q: Querier>(
 
 fn deposit_hook<S: Storage, A: Api, Q: Querier>(
     deps: &mut Extern<S, A, Q>,
-    _env: Env,
+    env: Env,
     config: Config,
     mut reward_pool: RewardPool,
     from: HumanAddr,
     amount: u128,
 ) -> StdResult<HandleResponse> {
-    let mut messages: Vec<CosmosMsg> = vec![];
-    let mut users_store = TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage);
-    let mut user = users_store
+
+
+    let sender_address = deps.api.canonical_address(&from)?;
+    let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
         .load(from.0.as_bytes())
         .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
 
-    if user.locked > 0 {
-        //giving the extra change in acc_reward_per_share when the last time deposit was called..
-        let pending = user.locked * reward_pool.acc_reward_per_share / REWARD_SCALE - user.debt;
-        if pending > 0 {
-            messages.push(secret_toolkit::snip20::transfer_msg(
-                from.clone(),
-                Uint128(pending),
-                None,
-                RESPONSE_BLOCK_SIZE,
-                config.reward_token.contract_hash,
-                config.reward_token.address,
-            )?);
-        }
+    let account_balance = user.locked;
+
+    let mut a_lottery = lottery(&mut deps.storage).load()?;
+    if a_lottery.entries.len() > 0 {
+        &a_lottery.entries.retain(|(k, _)| k != &sender_address);
     }
+    &a_lottery.entries.push((
+        sender_address.clone(),
+        Uint128::from(account_balance + amount),
+    ));
+    &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
+    &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+    lottery(&mut deps.storage).save(&a_lottery);
 
-    user.locked += amount;
-    user.debt = user.locked * reward_pool.acc_reward_per_share / REWARD_SCALE;
-    users_store.store(from.0.as_bytes(), &user)?;
+    user.locked+=amount;
+    TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(from.0.as_bytes(), &user)?;
 
-    reward_pool.inc_token_supply += amount;
-    TypedStoreMut::attach(&mut deps.storage).store(REWARD_POOL_KEY, &reward_pool)?;
+    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
+    reward_pool.inc_token_supply+=amount;
+    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
 
     Ok(HandleResponse {
-        messages,
+        messages:vec![],
         log: vec![],
         data: Some(to_binary(&LPStakingReceiveAnswer::Deposit {
             status: Success,
@@ -320,6 +508,7 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     to: HumanAddr,
     amount: Option<Uint128>,
 ) -> StdResult<HandleResponse> {
+    let sender_address = deps.api.canonical_address(&to)?;
     let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
         .load(to.0.as_bytes())
         .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
@@ -333,38 +522,25 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     }
 
     let mut messages: Vec<CosmosMsg> = vec![];
-    let pending = user.locked * reward_pool.acc_reward_per_share / REWARD_SCALE - user.debt;
-    // debug_print(format!("DEBUG DEBUG DEBUG"));
-    // debug_print(format!(
-    //     "reward pool: | residue: {} | total supply: {} | acc: {} |",
-    //     reward_pool.residue, reward_pool.inc_token_supply, reward_pool.acc_reward_per_share
-    // ));
-    // debug_print(format!(
-    //     "user: | locked: {} | debt: {} |",
-    //     user.locked, user.debt
-    // ));
-    // debug_print(format!("pending: {}", pending));
-    // debug_print(format!("DEBUG DEBUG DEBUG"));
-    if pending > 0 {
-        // Transfer rewards
-        messages.push(secret_toolkit::snip20::transfer_msg(
-            to.clone(),
-            Uint128(pending),
-            None,
-            RESPONSE_BLOCK_SIZE,
-            config.reward_token.contract_hash,
-            config.reward_token.address,
-        )?);
+    let account_balance = user.locked;
+    let mut a_lottery = lottery(&mut deps.storage).load()?;
+    if a_lottery.entries.len() > 0 {
+        &a_lottery.entries.retain(|(k, _)| k != &sender_address);
     }
+    &a_lottery.entries.push((
+        sender_address.clone(),
+        Uint128::from(account_balance - amount),
+    ));
+    &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
+    &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
+    lottery(&mut deps.storage).save(&a_lottery);
 
     // Transfer redeemed tokens
     user.locked -= amount;
-    user.debt = user.locked * reward_pool.acc_reward_per_share / REWARD_SCALE;
     TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(to.0.as_bytes(), &user)?;
 
     reward_pool.inc_token_supply -= amount;
     TypedStoreMut::attach(&mut deps.storage).store(REWARD_POOL_KEY, &reward_pool)?;
-
     messages.push(secret_toolkit::snip20::transfer_msg(
         to,
         Uint128(amount),
@@ -629,16 +805,7 @@ fn update_rewards<S: Storage, A: Api, Q: Querier>(
         return Ok(reward_pool);
     }
 
-    if reward_pool.inc_token_supply == 0 {
-        reward_pool.residue += newly_allocated;
-        rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
-        return Ok(reward_pool);
-    }
-
-    // Effectively distributes the residue to the first one that stakes to an empty pool
-    reward_pool.acc_reward_per_share +=
-        (newly_allocated + reward_pool.residue) * REWARD_SCALE / reward_pool.inc_token_supply;
-    reward_pool.residue = 0;
+    reward_pool.total_rewards+=newly_allocated;
     rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
 
     Ok(reward_pool)
@@ -660,6 +827,26 @@ fn update_allocation(env: Env, config: Config, hook: Option<Binary>) -> StdResul
         log: vec![],
         data: None,
     })
+}
+
+
+
+/// validate_end_height returns an error if the lottery ends in the future
+fn validate_end_height(end_height: u64, env: Env) -> StdResult<()> {
+    if env.block.height < end_height {
+        Err(StdError::generic_err("Lottery end height is in the future"))
+    } else {
+        Ok(())
+    }
+}
+
+/// validate_start_height returns an error if the lottery hasn't started
+fn validate_start_height(start_height: u64, env: Env) -> StdResult<()> {
+    if env.block.height < start_height {
+        Err(StdError::generic_err("Lottery start height is in the future"))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -696,7 +883,7 @@ mod tests {
                 contract_hash: "reward_token".to_string(),
             },
             inc_token: SecretContract {
-                address: HumanAddr("Lp-sScrt-sEth".to_string()),
+                address: HumanAddr("sefi".to_string()),
                 contract_hash: "inc_token".to_string(),
             },
             prng_seed: Binary::from("lolz fun yay".as_bytes()),
@@ -786,189 +973,23 @@ mod tests {
         Failure,
     }
 
-    ///Initialization
     #[test]
-    fn initialized_snip20_messages() {
-        let (_init_result, _deps) = init_helper();
-        //two register receive and two set viewing key msgs
-        assert_eq!(4, _init_result.unwrap().messages.len());
-    }
 
-    #[test]
-    fn initialized_configuration() {
-        let (_init_result, mut deps) = init_helper();
-        let env = mock_env("admin", &[], 1);
-        //two register receive and two set viewing key msgs
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(config.admin.0, "admin");
-        assert_eq!(config.reward_token.address.0, "sefi");
-        assert_eq!(config.inc_token.address.0, "Lp-sScrt-sEth");
-        assert_eq!(config.is_stopped, false);
-        assert_eq!(config.master.address.0, "Master");
-        assert_eq!(config.own_addr.0, env.contract.address.to_string());
-        assert_eq!(config.viewing_key, "123");
-    }
-
-    #[test]
-    fn initialized_reward_pool() {
-        let (_init_result, mut deps) = init_helper();
-        let reward_pool: RewardPool = TypedStoreMut::attach(&mut deps.storage).load(REWARD_POOL_KEY).unwrap();
-        assert_eq!(reward_pool.residue, 0);
-        assert_eq!(reward_pool.acc_reward_per_share, 0);
-        assert_eq!(reward_pool.inc_token_supply, 0);
-    }
-
-    #[test]
-    fn initialized_token_info() {
-        let (_init_result, deps) = init_helper();
-        let token_info: TokenInfo = TypedStore::attach(&deps.storage).load(TOKEN_INFO_KEY).unwrap();
-        assert_eq!(token_info.name, "");
-        assert_eq!(token_info.symbol, "");
-    }
-
-    ///Handle
-    #[test]
-    fn checking_create_viewing_key() {
+    fn testing_receive(){
         let env = mock_env("admin", &[], 10);
         let (_init_result, mut deps) = init_helper();
-        let entropy = "entropy".to_string();
-
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        let prng_seed = config.prng_seed;
-        let key = ViewingKey::new(&env, &prng_seed, (&entropy.clone()).as_ref());
-        let vk: Vec<u8> = key.to_hashed().to_vec();
-
-        let handle_msg = LPStakingHandleMsg::CreateViewingKey { entropy, padding: None };
-        &handle(&mut deps, env.clone(), handle_msg);
-        let vk_store = ReadonlyPrefixedStorage::new(VIEWING_KEY_KEY, &deps.storage);
-        let expected_key = vk_store.get(env.message.sender.0.as_bytes()).unwrap();
-
-        assert_eq!(vk, expected_key);
-    }
-
-    #[test]
-    fn checking_set_viewing_key() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        let key = "setting_viewing_key".to_string();
-        let vk: Vec<u8> = ViewingKey(key.clone()).to_hashed().to_vec();
-        let handle_msg = LPStakingHandleMsg::SetViewingKey { key, padding: None };
-        &handle(&mut deps, env.clone(), handle_msg);
-        let vk_store = ReadonlyPrefixedStorage::new(VIEWING_KEY_KEY, &deps.storage);
-        let expected_key: Vec<u8> = vk_store.get(env.message.sender.0.as_bytes()).unwrap();
-        assert_eq!(vk, expected_key);
-    }
-
-    #[test]
-    fn checking_contract_stopped() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        let handle_msg = LPStakingHandleMsg::StopContract {};
-        &handle(&mut deps, env.clone(), handle_msg);
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(config.is_stopped, true);
-
-        let (init_result, mut deps) = init_helper();
-
-        let stop_msg = LPStakingHandleMsg::StopContract {};
-        let handle_response = handle(&mut deps, mock_env("not_admin", &[], 10), stop_msg.clone());
-        assert_eq!(
-            handle_response.unwrap_err(),
-            StdError::GenericErr {
-                msg: "not an admin: not_admin".to_string(),
-                backtrace: None,
-            }
-        );
-
-        let handle_response = handle(&mut deps, mock_env("admin", &[], 10), stop_msg);
-        let unwrapped_result: LPStakingHandleAnswer =
-            from_binary(&handle_response.unwrap().data.unwrap()).unwrap();
-        assert_eq!(
-            to_binary(&unwrapped_result).unwrap(),
-            to_binary(&LPStakingHandleAnswer::StopContract { status: Success }).unwrap()
-        );
-
-        let redeem_msg = LPStakingHandleMsg::Redeem { amount: None };
-        let handle_response = handle(&mut deps, mock_env("user", &[], 20), redeem_msg);
-        assert_eq!(
-            handle_response.unwrap_err(),
-            StdError::GenericErr {
-                msg: "this contract is stopped and this action is not allowed".to_string(),
-                backtrace: None,
-            }
-        );
-
-        let resume_msg = LPStakingHandleMsg::ResumeContract {};
-        let handle_response = handle(&mut deps, mock_env("admin", &[], 21), resume_msg);
-        let unwrapped_result: LPStakingHandleAnswer =
-            from_binary(&handle_response.unwrap().data.unwrap()).unwrap();
-        assert_eq!(
-            to_binary(&unwrapped_result).unwrap(),
-            to_binary(&LPStakingHandleAnswer::ResumeContract { status: Success }).unwrap()
-        );
-    }
-
-    #[test]
-    fn checking_resume_contract() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        let handle_msg = LPStakingHandleMsg::StopContract {};
-        &handle(&mut deps, env.clone(), handle_msg);
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(config.is_stopped, true);
-
-        let handle_msg = LPStakingHandleMsg::ResumeContract {};
-        &handle(&mut deps, env.clone(), handle_msg);
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(config.is_stopped, false);
-    }
-
-
-    #[test]
-    fn change_admin() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        let handle_msg = LPStakingHandleMsg::ChangeAdmin { address: HumanAddr("chadBoy".to_string()) };
-        &handle(&mut deps, env.clone(), handle_msg);
-
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(config.admin, HumanAddr("chadBoy".to_string()));
-    }
-
-
-    #[test]
-    fn testing_receive() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-
-        //1)when sender is not inc token
-        let handle_msg = LPStakingHandleMsg::Receive {
-            sender: HumanAddr("admin".to_string()),
-            from: HumanAddr("haseeb".to_string()),
-            amount: Uint128(1000),
-            msg: to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap(),
-        };
-        let unwrapped_errors = handle(&mut deps, env.clone(), handle_msg);
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-
-
-        assert_eq!(unwrapped_errors.unwrap_err(), StdError::generic_err(format!(
-            "This token is not supported. Supported: {}, given: {}",
-            config.inc_token.address, env.message.sender
-        )));
-
         //2) Checking the HandleResponse
-        let env = mock_env("Lp-sScrt-sEth", &[], 10);
+        let env = mock_env("sefi", &[], 10);
         let handle_msg = LPStakingHandleMsg::Receive {
-            sender: HumanAddr("Lp-sScrt-sEth".to_string()),
-            from: HumanAddr("Lp-sScrt-sEth".to_string()),
+            sender: HumanAddr("sefi".to_string()),
+            from: HumanAddr("Batman".to_string()),
             amount: Uint128(1000),
             msg: to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap(),
         };
         let unwrapped_msg = handle(&mut deps, env.clone(), handle_msg).unwrap();
         let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
 
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("Lp-sScrt-sEth".to_string()), amount: Uint128(1000) }).unwrap());
+        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("Batman".to_string()), amount: Uint128(1000) }).unwrap());
 
         assert_eq!(unwrapped_msg.messages[0], WasmMsg::Execute {
             contract_addr: config.master.address,
@@ -979,27 +1000,8 @@ mod tests {
                 hook,
             }).unwrap(),
             send: vec![],
-        }
-            .into());
+        }.into());
 
-        //3) Calling master contract
-        let env = mock_env("admin", &[], 10);
-        let hook = Some(to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap());
-        let msgs = master_update_allocation(&mut deps, env.clone(),
-                                            env.contract.address.clone(), env.contract_code_hash.clone(), hook.clone());
-        let unwrapped_msgs = msgs.unwrap();
-
-        assert_eq!(unwrapped_msgs.messages[1], WasmMsg::Execute {
-            contract_addr: env.contract.address.clone(),
-            callback_code_hash: env.contract_code_hash.clone(),
-            msg: to_binary(&LPStakingHandleMsg::NotifyAllocation {
-                amount: Uint128(100),
-                hook,
-            }).unwrap(),
-            send: vec![],
-        }
-            .into(),
-        );
     }
 
     #[test]
@@ -1022,188 +1024,42 @@ mod tests {
     }
 
     #[test]
-    fn testing_reward_pool() {
-        //1)
-        let (_init_result, mut deps) = init_helper();
-        let env = mock_env("Master", &[], 10);
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User1".to_string()), amount: Uint128(1000) }).unwrap());
-        //amount here means reward send from master contract
-        let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(1500), hook };
-        handle(&mut deps, env.clone(), handle_msg).unwrap();
+    fn testing_claim_rewards(){
+            //1)
+            let (_init_result, mut deps) = init_helper();
+            let env = mock_env("Master", &[], 10);
 
-        //checking reward pool
+            let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User1".to_string()), amount: Uint128(100) }).unwrap());
+            let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(1000), hook };
+            handle(&mut deps, env.clone(), handle_msg).unwrap();
 
-        let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
-        let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
-        assert_eq!(reward_pool.inc_token_supply, 1000);
-        assert_eq!(reward_pool.residue, 1500);
-        assert_eq!(reward_pool.acc_reward_per_share, 0);
-
-
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User2".to_string()), amount: Uint128(2000) }).unwrap());
-        //amount here means reward send from master contract
-        let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(3000), hook };
-        handle(&mut deps, env, handle_msg).unwrap();
-
-
-        let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
-        let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
-        pub const REWARD_SCALE: u128 = 1_000_000_000_000;
-        let acc_reward_per_share = 4500 * REWARD_SCALE / 1000;
-        //acc_reward_per_share changes before the inc_token_supply is updated.
-        assert_eq!(reward_pool.inc_token_supply, 3000);
-        assert_eq!(reward_pool.residue, 0);
-        assert_eq!(reward_pool.acc_reward_per_share, acc_reward_per_share)
-    }
-
-    #[test]
-    fn testing_users() {
-        //1)
-        let (_init_result, mut deps) = init_helper();
-        let env = mock_env("Master", &[], 10);
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User1".to_string()), amount: Uint128(1000) }).unwrap());
-        //amount here means reward send from master contract
+        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User2".to_string()), amount: Uint128(100) }).unwrap());
         let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(1000), hook };
         handle(&mut deps, env.clone(), handle_msg).unwrap();
 
-        let mut from = HumanAddr("User1".to_string());
+        let mut a_lottery = lottery(&mut deps.storage).load().unwrap();
 
-        let mut users_store = TypedStoreMut::attach(&mut deps.storage);
-        let mut user = users_store
-            .load(from.0.as_bytes())
-            .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
+        // assert_eq!(a_lottery.start_height,11);
+        // assert_eq!(a_lottery.end_height,12);
+        // claim_rewards(&mut deps,env);
 
-        assert_eq!(user.locked, 1000);
-        assert_eq!(user.debt, 0);
-
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User1".to_string()), amount: Uint128(1000) }).unwrap());
-        //amount here means reward send from master contract
-        let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(1000), hook };
-        handle(&mut deps, env, handle_msg).unwrap();
-
-        let mut from = HumanAddr("User1".to_string());
-        let mut users_store = TypedStoreMut::attach(&mut deps.storage);
-        let mut user = users_store
-            .load(from.0.as_bytes())
-            .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
-
-        assert_eq!(user.locked, 2000);
-        assert_eq!(user.debt, 4000);
-    }
-
-    #[test]
-    fn testing_inc_token_supply() {
-        let (_init_result, mut deps) = init_helper();
-        let env = mock_env("Master", &[], 10);
-        let hook = Some(to_binary(&LPStakingHookMsg::Deposit { from: HumanAddr("User1".to_string()), amount: Uint128(1000) }).unwrap());
-        //amount here means reward send from master contract
-        let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount: Uint128(2000), hook };
-        handle(&mut deps, env.clone(), handle_msg).unwrap();
-
+        // let env = mock_env("Master", &[], 20);
+        // let handle_msg = LPStakingHandleMsg::ClaimRewards {};
+        // handle(&mut deps, env.clone(), handle_msg).unwrap();
         let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
         let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
 
-        assert_eq!(reward_pool.residue, 2000);
-        assert_eq!(reward_pool.inc_token_supply, 1000);
-        assert_eq!(reward_pool.acc_reward_per_share, 0);
+        assert_eq!(reward_pool.inc_token_supply,200);
+        assert_eq!(reward_pool.total_rewards,0);
+
+
+
+
+
+
     }
 
-    #[test]
-    fn testing_redeem() {
-        // receive -- deposit
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
 
-        //1)when sender is not inc token
-        let handle_msg = LPStakingHandleMsg::Receive {
-            sender: HumanAddr("admin".to_string()),
-            from: HumanAddr("haseeb".to_string()),
-            amount: Uint128(1000),
-            msg: to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap(),
-        };
-        handle(&mut deps, env.clone(), handle_msg);
 
-        //redeem
-        let env = mock_env("haseeb", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        //1)when sender is not inc token
-        let handle_msg = LPStakingHandleMsg::Redeem {
-            amount: Some(Uint128(1000)),
-        };
-        let hook = Some(to_binary(&LPStakingHookMsg::Redeem {
-            to: env.message.sender.clone(),
-            amount: Some(Uint128(1000)),
-        }).unwrap());
-        let unwrapped = handle(&mut deps, env.clone(), handle_msg).unwrap();
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
 
-        assert_eq!(unwrapped.messages[0], WasmMsg::Execute {
-            contract_addr: config.master.address,
-            callback_code_hash: config.master.contract_hash,
-            msg: to_binary(&MasterHandleMsg::UpdateAllocation {
-                spy_addr: env.contract.address,
-                spy_hash: env.contract_code_hash,
-                hook,
-            }).unwrap(),
-            send: vec![],
-        }
-            .into());
-    }
-
-    //Query
-    #[test]
-    fn testing_contract_status() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        // query_contract_status()
-        let query_msg = LPStakingQueryMsg::ContractStatus {};
-        let results: LPStakingQueryAnswer = from_binary(&query(&deps, query_msg).unwrap()).unwrap();
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-
-        assert_eq!(to_binary(&results).unwrap(), to_binary(&LPStakingQueryAnswer::ContractStatus { is_stopped: config.is_stopped }).unwrap());
-    }
-
-    #[test]
-    fn testing_reward_token() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        // query_contract_status()
-        let query_msg = LPStakingQueryMsg::RewardToken {};
-        let results: LPStakingQueryAnswer = from_binary(&query(&deps, query_msg).unwrap()).unwrap();
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-
-        assert_eq!(to_binary(&results).unwrap(), to_binary(&LPStakingQueryAnswer::RewardToken {
-            token: config.reward_token,
-        }).unwrap());
-    }
-
-    #[test]
-    fn testing_inc_token() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        // query_contract_status()
-        let query_msg = LPStakingQueryMsg::IncentivizedToken {};
-        let results: LPStakingQueryAnswer = from_binary(&query(&deps, query_msg).unwrap()).unwrap();
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        assert_eq!(to_binary(&results).unwrap(), to_binary(&LPStakingQueryAnswer::IncentivizedToken {
-            token: config.inc_token,
-        }).unwrap());
-    }
-
-    #[test]
-    fn testing_token_info() {
-        let env = mock_env("admin", &[], 10);
-        let (_init_result, mut deps) = init_helper();
-        let query_msg = LPStakingQueryMsg::TokenInfo {};
-        let results: LPStakingQueryAnswer = from_binary(&query(&deps, query_msg).unwrap()).unwrap();
-        let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY).unwrap();
-        let token_info: TokenInfo = TypedStore::attach(&deps.storage).load(TOKEN_INFO_KEY).unwrap();
-
-        assert_eq!(to_binary(&results).unwrap(), to_binary(&LPStakingQueryAnswer::TokenInfo {
-            name: token_info.name,
-            symbol: token_info.symbol,
-            decimals: 1,
-            total_supply: None,
-        }).unwrap());
-    }
 }

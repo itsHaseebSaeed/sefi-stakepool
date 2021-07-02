@@ -2,6 +2,7 @@ mod constants;
 pub mod contract;
 pub mod querier;
 pub mod state;
+mod rand;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
