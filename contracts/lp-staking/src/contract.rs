@@ -99,7 +99,7 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
 
     //lottery init
     let height = env.block.height;
-    let duration = 1u64;
+    let duration = 10u64;
     //Create first lottery
     ///Why entropy and seed are the same here
     let a_lottery = Lottery {
@@ -240,7 +240,14 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
     let entry_iter = &a_lottery.entries.clone();
     let weight_iter = &a_lottery.entries.clone();
     let entries: Vec<_> = entry_iter.into_iter().map(|(k, _)| k).collect();
-    let weights: Vec<_> = weight_iter.into_iter().map(|(_, v)| v.u128()).collect();
+
+    let weights:Vec<_>= weight_iter.into_iter().map(|(_, v,l)|
+    if ((a_lottery.end_height-l)/a_lottery.duration) > 1 {
+        v.u128();
+    } else{
+            v.u128()*((a_lottery.end_height-l)/a_lottery.duration)
+        }
+    ).collect();
 
 
     log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
@@ -315,7 +322,6 @@ fn notify_allocation<S: Storage, A: Api, Q: Querier>(
     //amount == rewards
     let mut reward_pool = update_rewards(deps, /*&env, &config,*/ rewards)?;
 
-
     let mut response = Ok(HandleResponse {
         messages: vec![],
         log: vec![],
@@ -374,7 +380,7 @@ fn deposit_hook<S: Storage, A: Api, Q: Querier>(
     let sender_address = deps.api.canonical_address(&from)?;
     let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
         .load(from.0.as_bytes())
-        .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
+        .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: env.block.height }); // NotFound is the only possible error
 
     let account_balance = user.locked;
 
@@ -382,9 +388,13 @@ fn deposit_hook<S: Storage, A: Api, Q: Querier>(
     if a_lottery.entries.len() > 0 {
         &a_lottery.entries.retain(|(k, _)| k != &sender_address);
     }
+
+    user.start_height=env.block.height;
+
     &a_lottery.entries.push((
         sender_address.clone(),
         Uint128::from(account_balance + amount),
+        user.start_height,
     ));
     &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
     &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
@@ -433,7 +443,7 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     let sender_address = deps.api.canonical_address(&to)?;
     let mut user = TypedStore::<UserInfo, S>::attach(&deps.storage)
         .load(to.0.as_bytes())
-        .unwrap_or(UserInfo { locked: 0, debt: 0 }); // NotFound is the only possible error
+        .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: env.block.height }); // NotFound is the only possible error
     let amount = amount.unwrap_or(Uint128(user.locked)).u128();
 
     if amount > user.locked {
@@ -452,7 +462,9 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     &a_lottery.entries.push((
         sender_address.clone(),
         Uint128::from(account_balance - amount),
+        user.start_height,
     ));
+    //
     &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
     &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
     lottery(&mut deps.storage).save(&a_lottery);
@@ -592,7 +604,7 @@ fn emergency_redeem<S: Storage, A: Api, Q: Querier>(
     let config: Config = TypedStore::attach(&deps.storage).load(CONFIG_KEY)?;
     let mut user: UserInfo = TypedStoreMut::attach(&mut deps.storage)
         .load(env.message.sender.0.as_bytes())
-        .unwrap_or(UserInfo { locked: 0, debt: 0 });
+        .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: env.block.height });
 
     let mut reward_pool: RewardPool =
         TypedStoreMut::attach(&mut deps.storage).load(REWARD_POOL_KEY)?;
@@ -611,7 +623,7 @@ fn emergency_redeem<S: Storage, A: Api, Q: Querier>(
         )?);
     }
 
-    user = UserInfo { locked: 0, debt: 0 };
+    user = UserInfo { locked: 0, debt: 0, start_height: env.block.height };
     TypedStoreMut::attach(&mut deps.storage).store(env.message.sender.0.as_bytes(), &user)?;
 
     Ok(HandleResponse {
@@ -634,7 +646,7 @@ fn query_pending_rewards<S: Storage, A: Api, Q: Querier>(
     let reward_pool = TypedStore::<RewardPool, S>::attach(&deps.storage).load(REWARD_POOL_KEY)?;
     let user = TypedStore::<UserInfo, S>::attach(&deps.storage)
         .load(address.0.as_bytes())
-        .unwrap_or(UserInfo { locked: 0, debt: 0 });
+        .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: 0 });
     let mut acc_reward_per_share = reward_pool.acc_reward_per_share;
 
     if reward_pool.inc_token_supply != 0 {
@@ -655,7 +667,7 @@ fn query_deposit<S: Storage, A: Api, Q: Querier>(
 ) -> StdResult<Binary> {
     let user = TypedStore::attach(&deps.storage)
         .load(address.0.as_bytes())
-        .unwrap_or(UserInfo { locked: 0, debt: 0 });
+        .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: 0 });
 
     to_binary(&LPStakingQueryAnswer::Balance {
         amount: Uint128(user.locked),

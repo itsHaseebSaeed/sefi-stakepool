@@ -21,6 +21,7 @@ pub struct TokenInfo {
 pub struct UserInfo {
     pub locked: u128,
     pub debt: u128,
+    pub start_height:u64,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, JsonSchema)]

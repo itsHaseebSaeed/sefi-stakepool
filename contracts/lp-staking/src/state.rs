@@ -20,7 +20,8 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Lottery {
-    pub entries: Vec<(CanonicalAddr, Uint128)>,
+    //sender_address, amount, entry_height
+    pub entries: Vec<(CanonicalAddr, Uint128,u64)>,
     pub entropy: Vec<u8>,
     pub seed: Vec<u8>,
     pub duration: u64,
