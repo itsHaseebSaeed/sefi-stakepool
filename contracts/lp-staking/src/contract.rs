@@ -286,80 +286,6 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
 }
 
 
-fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
-    deps: &mut Extern<S, A, Q>,
-    env: Env,
-    mut reward_pool:RewardPool
-) -> StdResult<RewardPool> {
-
-
-    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
-    let winning_amount = reward_pool.total_rewards;
-    if winning_amount == 0 {
-        return Err(StdError::generic_err(
-            "no rewards available",
-        ));
-    }
-    reward_pool.total_rewards=0;
-    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
-
-
-    let mut a_lottery = lottery(&mut deps.storage).load()?;
-    validate_end_height(a_lottery.end_height, env.clone())?;
-    validate_start_height(a_lottery.start_height, env.clone())?;
-    a_lottery.entropy.extend(&env.block.height.to_be_bytes());
-    a_lottery.entropy.extend(&env.block.time.to_be_bytes());
-
-    // restart the lottery in the next block
-    a_lottery.start_height = &env.block.height + 1;
-    a_lottery.end_height = &env.block.height + a_lottery.duration + 1;
-    lottery(&mut deps.storage).save(&a_lottery)?;
-
-
-    let entry_iter = &a_lottery.entries.clone();
-    let weight_iter = &a_lottery.entries.clone();
-    let entries: Vec<_> = entry_iter.into_iter().map(|(k, _)| k).collect();
-    let weights: Vec<_> = weight_iter.into_iter().map(|(_, v)| v.u128()).collect();
-
-
-    log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
-
-    let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY)?;
-    let prng_seed = config.prng_seed;
-
-    let mut hasher = Sha256::new();
-    hasher.update(&prng_seed);
-    hasher.update(&a_lottery.entropy);
-    let hash = hasher.finalize();
-
-    let mut result = [0u8; 32];
-    result.copy_from_slice(hash.as_slice());
-
-    let mut rng: ChaChaRng = ChaChaRng::from_seed(result);
-    let dist = WeightedIndex::new(&weights).unwrap();
-    let sample = dist.sample(&mut rng).clone();
-    let winner = entries[sample];
-
-    let winner_human = &deps.api.human_address(&winner.clone()).unwrap();
-    log_string(&mut deps.storage).save(&format!("And the winner is {}", winner_human.as_str()))?;
-
-    let mut messages: Vec<CosmosMsg> = vec![];
-    messages.push(secret_toolkit::snip20::transfer_msg(
-        winner_human.clone(),
-        Uint128(winning_amount),
-        None,
-        RESPONSE_BLOCK_SIZE,
-        config.reward_token.contract_hash,
-        config.reward_token.address,
-    )?);
-
-
-
-
-
-    Ok(reward_pool)
-}
-
 fn receive<S: Storage, A: Api, Q: Querier>(
     deps: &mut Extern<S, A, Q>,
     env: Env,
@@ -389,10 +315,6 @@ fn notify_allocation<S: Storage, A: Api, Q: Querier>(
     //amount == rewards
     let mut reward_pool = update_rewards(deps, /*&env, &config,*/ rewards)?;
 
-    //claim_rewards calling
-    if reward_pool.inc_token_supply>0{
-     reward_pool= claim_rewards_hook(deps,env.clone(),reward_pool)?;
-    }
 
     let mut response = Ok(HandleResponse {
         messages: vec![],
