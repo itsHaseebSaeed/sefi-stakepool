@@ -27,6 +27,7 @@ use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
+use rust_decimal::prelude::ToPrimitive;
 
 
 pub fn init<S: Storage, A: Api, Q: Querier>(
@@ -226,8 +227,8 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
 
 
     let mut a_lottery = lottery(&mut deps.storage).load()?;
-    validate_end_height(a_lottery.end_height, env.clone())?;
-    validate_start_height(a_lottery.start_height, env.clone())?;
+    validate_end_height(a_lottery.end_height, env.block.height)?;
+    validate_start_height(a_lottery.start_height, env.block.height)?;
     a_lottery.entropy.extend(&env.block.height.to_be_bytes());
     a_lottery.entropy.extend(&env.block.time.to_be_bytes());
 
@@ -237,15 +238,15 @@ fn claim_rewards<S: Storage, A: Api, Q: Querier>(
     lottery(&mut deps.storage).save(&a_lottery)?;
 
 
-    let entry_iter = &a_lottery.entries.clone();
-    let weight_iter = &a_lottery.entries.clone();
-    let entries: Vec<_> = entry_iter.into_iter().map(|(k, _)| k).collect();
+    // let entry_iter = &a_lottery.entries.clone();
+    // let weight_iter = &a_lottery.entries.clone();
+    let entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(k, _,_)| k).collect();
 
-    let weights:Vec<_>= weight_iter.into_iter().map(|(_, v,l)|
+    let weights:Vec<u128>= (&a_lottery.entries).into_iter().map(|(_, v,l)|
     if ((a_lottery.end_height-l)/a_lottery.duration) > 1 {
-        v.u128();
+        v.u128()
     } else{
-            v.u128()*((a_lottery.end_height-l)/a_lottery.duration)
+            v.u128()*((a_lottery.end_height-l)/a_lottery.duration).to_u128().unwrap()
         }
     ).collect();
 
@@ -386,7 +387,7 @@ fn deposit_hook<S: Storage, A: Api, Q: Querier>(
 
     let mut a_lottery = lottery(&mut deps.storage).load()?;
     if a_lottery.entries.len() > 0 {
-        &a_lottery.entries.retain(|(k, _)| k != &sender_address);
+        &a_lottery.entries.retain(|(k, _,_)| k != &sender_address);
     }
 
     user.start_height=env.block.height;
@@ -457,7 +458,7 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     let account_balance = user.locked;
     let mut a_lottery = lottery(&mut deps.storage).load()?;
     if a_lottery.entries.len() > 0 {
-        &a_lottery.entries.retain(|(k, _)| k != &sender_address);
+        &a_lottery.entries.retain(|(k, _,_)| k != &sender_address);
     }
     &a_lottery.entries.push((
         sender_address.clone(),
@@ -766,8 +767,8 @@ fn update_allocation(env: Env, config: Config, hook: Option<Binary>) -> StdResul
 
 
 /// validate_end_height returns an error if the lottery ends in the future
-fn validate_end_height(end_height: u64, env: Env) -> StdResult<()> {
-    if env.block.height < end_height {
+fn validate_end_height(end_height: u64, height: u64) -> StdResult<()> {
+    if height < end_height {
         Err(StdError::generic_err("Lottery end height is in the future"))
     } else {
         Ok(())
@@ -775,8 +776,8 @@ fn validate_end_height(end_height: u64, env: Env) -> StdResult<()> {
 }
 
 /// validate_start_height returns an error if the lottery hasn't started
-fn validate_start_height(start_height: u64, env: Env) -> StdResult<()> {
-    if env.block.height < start_height {
+fn validate_start_height(start_height: u64, height: u64) -> StdResult<()> {
+    if height < start_height {
         Err(StdError::generic_err("Lottery start height is in the future"))
     } else {
         Ok(())
