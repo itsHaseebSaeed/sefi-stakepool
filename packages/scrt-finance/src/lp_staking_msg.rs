@@ -84,6 +84,9 @@ pub enum LPStakingHookMsg {
         to: HumanAddr,
         amount: Option<Uint128>,
     },
+    ClaimRewards {
+
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]

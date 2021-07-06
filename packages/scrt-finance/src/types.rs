@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 // RewardPool is a struct that keeps track of rewards and lockups
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
 pub struct RewardPool {
-    pub residue: u128,
     pub inc_token_supply: u128,
-    pub acc_reward_per_share: u128,
     pub total_rewards:u128,
 }
 
