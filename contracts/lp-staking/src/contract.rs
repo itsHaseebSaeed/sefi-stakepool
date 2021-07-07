@@ -41,7 +41,7 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
     config_store.store(
         CONFIG_KEY,
         &Config {
-            admin: env.message.sender,
+            admin: env.message.sender.clone(),
             reward_token: msg.reward_token.clone(),
             inc_token: msg.inc_token.clone(),
             master: msg.master,
@@ -387,7 +387,7 @@ fn deposit_hook<S: Storage, A: Api, Q: Querier>(
     user.start_height=env.block.height;
 
     &a_lottery.entries.push((
-        sender_address.clone(),
+        sender_address,
         Uint128::from(account_balance + amount),
         user.start_height,
     ));
@@ -455,7 +455,6 @@ fn redeem_hook<S: Storage, A: Api, Q: Querier>(
     &a_lottery.entropy.extend(&env.block.height.to_be_bytes());
     &a_lottery.entropy.extend(&env.block.time.to_be_bytes());
     lottery(&mut deps.storage).save(&a_lottery);
-
     // Transfer redeemed tokens
     user.locked -= amount;
     TypedStoreMut::<UserInfo, S>::attach(&mut deps.storage).store(to.0.as_bytes(), &user)?;
@@ -1018,10 +1017,8 @@ mod tests {
         let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
 
         assert_eq!(500,reward_pool.inc_token_supply);
-
-
-
     }
+
 
 
 
