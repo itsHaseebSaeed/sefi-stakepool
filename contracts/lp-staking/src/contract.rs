@@ -221,18 +221,12 @@ fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
     env: Env,
     mut reward_pool:RewardPool,
 ) -> StdResult<HandleResponse> {
-
-
-    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
     let winning_amount = reward_pool.total_rewards;
     if winning_amount == 0 {
         return Err(StdError::generic_err(
             "no rewards available",
         ));
     }
-    reward_pool.total_rewards=0;
-    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
-
 
     let mut a_lottery = lottery(&mut deps.storage).load()?;
     validate_end_height(a_lottery.end_height, env.block.height)?;
@@ -245,11 +239,7 @@ fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
     a_lottery.end_height = &env.block.height + a_lottery.duration + 1;
     lottery(&mut deps.storage).save(&a_lottery)?;
 
-
-    // let entry_iter = &a_lottery.entries.clone();
-    // let weight_iter = &a_lottery.entries.clone();
     let entries: Vec<_> = (&a_lottery.entries).into_iter().map(|(k, _,_)| k).collect();
-
     let weights:Vec<u128>= (&a_lottery.entries).into_iter().map(|(_, v,l)|
     if ((a_lottery.end_height-l)/a_lottery.duration) > 1 {
         v.u128()
@@ -259,7 +249,7 @@ fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
     ).collect();
 
 
-    log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
+    // log_string(&mut deps.storage).save(&format!("Number of entries = {}", &weights.len()))?;
 
     let config: Config = TypedStoreMut::attach(&mut deps.storage).load(CONFIG_KEY)?;
     let prng_seed = config.prng_seed;
@@ -277,18 +267,22 @@ fn claim_rewards_hook<S: Storage, A: Api, Q: Querier>(
     let sample = dist.sample(&mut rng).clone();
     let winner = entries[sample];
 
-    let winner_human = &deps.api.human_address(&winner.clone()).unwrap();
+    let winner_human = deps.api.human_address(&winner).unwrap();
     log_string(&mut deps.storage).save(&format!("And the winner is {}", winner_human.as_str()))?;
 
     let mut messages: Vec<CosmosMsg> = vec![];
     messages.push(secret_toolkit::snip20::transfer_msg(
-        winner_human.clone(),
+        winner_human,
         Uint128(winning_amount),
         None,
         RESPONSE_BLOCK_SIZE,
         config.reward_token.contract_hash,
         config.reward_token.address,
     )?);
+
+    let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
+    reward_pool.total_rewards=0;
+    rewards_store.store(REWARD_POOL_KEY, &reward_pool)?;
 
 
 
@@ -342,7 +336,8 @@ fn notify_allocation<S: Storage, A: Api, Q: Querier>(
             LPStakingHookMsg::ClaimRewards { } => {
                 claim_rewards_hook(deps, env,reward_pool)
             },
-            _ => claim_rewards_hook(deps,env,reward_pool)
+            _ => Err(StdError::generic_err(format!(
+                "This hook message is not supported.")))
         }
     }
 
@@ -940,14 +935,12 @@ mod tests {
         //1)
         let (_init_result, mut deps) = init_helper();
         let env = mock_env("sefi", &[], 10);
-
         let handle_msg = LPStakingHandleMsg::Receive {
             sender: HumanAddr("sefi".to_string()),
             from: HumanAddr("Batman".to_string()),
             amount: Uint128(1000),
             msg: to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap(),
         };
-
         let unwrapped_msg = handle(&mut deps, env.clone(), handle_msg).unwrap();
 
         //1) checking the amount locked for user(Batman)
@@ -955,11 +948,9 @@ mod tests {
         let mut user = TypedStore::attach(&deps.storage)
             .load(from.0.as_bytes())
             .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: env.block.height });
-
         assert_eq!(1000,user.locked);
         assert_eq!(0,user.debt);
         assert_eq!(10,user.start_height);
-
 
         //2)Checking Lottery values
         let mut a_lottery = lottery(&mut deps.storage).load().unwrap();
@@ -971,7 +962,6 @@ mod tests {
         //3)Checking rewards_pool
         let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
         let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
-
         assert_eq!(1000,reward_pool.inc_token_supply);
     }
 
@@ -980,7 +970,6 @@ mod tests {
         //1)depositing amount
         let (_init_result, mut deps) = init_helper();
         let env = mock_env("sefi", &[], 10);
-
         let handle_msg = LPStakingHandleMsg::Receive {
             sender: HumanAddr("sefi".to_string()),
             from: HumanAddr("Batman".to_string()),
@@ -991,11 +980,9 @@ mod tests {
 
         //2)Redeeming
         let env = mock_env("Batman", &[], 10);
-
         let handle_msg = LPStakingHandleMsg::Redeem {
             amount: Some(Uint128(500))
         };
-
         let unwrapped_msg = handle(&mut deps, env.clone(), handle_msg).unwrap();
 
 
@@ -1004,24 +991,51 @@ mod tests {
         let mut user = TypedStore::attach(&deps.storage)
             .load(to.0.as_bytes())
             .unwrap_or(UserInfo { locked: 0, debt: 0, start_height: env.block.height });
-
         assert_eq!(500,user.locked);
 
         //2)Checking Lottery values
         let mut a_lottery = lottery(&mut deps.storage).load().unwrap();
         assert_eq!(1,a_lottery.entries.len());
 
-
         //3)Checking rewards_pool
         let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
         let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
-
         assert_eq!(500,reward_pool.inc_token_supply);
     }
 
+    #[test]
+    fn testing_claim_rewards(){
+        //1)depositing amount
+        let (_init_result, mut deps) = init_helper();
+        let env = mock_env("sefi", &[], 10);
+        let handle_msg = LPStakingHandleMsg::Receive {
+            sender: HumanAddr("sefi".to_string()),
+            from: HumanAddr("Batman".to_string()),
+            amount: Uint128(1000),
+            msg: to_binary(&LPStakingReceiveMsg::Deposit {}).unwrap(),
+        };
+        handle(&mut deps, env.clone(), handle_msg).unwrap();
+
+        //2)claiming rewards
+        let env = mock_env("Master", &[], 20);
+        let handle_msg = LPStakingHandleMsg::ClaimRewards {};
+        let unwrapped_msg = handle(&mut deps, env.clone(), handle_msg).unwrap();
 
 
+        let hook = Some(to_binary(&LPStakingHookMsg::ClaimRewards {}).unwrap());
+        let handle_msg = LPStakingHandleMsg::NotifyAllocation { amount:Uint128(5000), hook };
+        let unwrapped_msg = handle(&mut deps, env.clone(), handle_msg).unwrap();
 
+        let mut a_lottery = lottery(&mut deps.storage).load().unwrap();
+        assert_eq!(1,a_lottery.entries.len());
+        assert_eq!(21,a_lottery.start_height);
+        assert_eq!(31,a_lottery.end_height);
 
+        let mut rewards_store = TypedStoreMut::attach(&mut deps.storage);
+        let mut reward_pool: RewardPool = rewards_store.load(REWARD_POOL_KEY).unwrap();
+        assert_eq!(1000,reward_pool.inc_token_supply);
+        assert_eq!(0,reward_pool.total_rewards);
+
+    }
 
 }
